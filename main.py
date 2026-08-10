@@ -1,53 +1,19 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
 import re
-from urllib.parse import unquote, urlsplit
-import json
-from fastapi.exceptions import RequestValidationError
-from starlette.exceptions import HTTPException as StarletteHTTPException
+import html
+from urllib.parse import urlparse, unquote
 
 app = FastAPI()
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# --- GLOBAL EXCEPTION TRAPS ---
-# Force all protocol errors (404 Not Found, 405 Method Not Allowed) to return the exact assignment schema
-@app.exception_handler(StarletteHTTPException)
-async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-    print(f"[TRAPPED HTTP {exc.status_code}] -> {request.method} {request.url.path}")
-    return JSONResponse(status_code=200, content={"safe": False, "reason": "INVALID_SCHEMA"})
-
-@app.exception_handler(RequestValidationError)
-async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    print("[TRAPPED 422 VALIDATION ERROR]")
-    return JSONResponse(status_code=200, content={"safe": False, "reason": "INVALID_SCHEMA"})
-
-@app.exception_handler(Exception)
-async def generic_exception_handler(request: Request, exc: Exception):
-    print(f"[TRAPPED 500 FATAL ERROR] -> {str(exc)}")
-    return JSONResponse(status_code=200, content={"safe": False, "reason": "INVALID_SCHEMA"})
-
-@app.get("/")
-@app.head("/")
-async def root_health_check():
-    return JSONResponse(content={"status": "live"})
-
 @app.post("/release-gate")
-@app.post("/release-gate/")
 async def release_gate(request: Request):
     try:
         payload = await request.json()
     except Exception:
         payload = {}
         
-    violations = set()
+    violations = set() # Set prevents duplicate violation strings
     
     target = payload.get("target", "")
     event = payload.get("event", "")
@@ -55,40 +21,50 @@ async def release_gate(request: Request):
     workflow = payload.get("workflow", {})
     image = payload.get("image", {})
 
+    # 1. Least Privilege Permissions
     expected_perms = {"contents": "read", "packages": "write", "id-token": "none"}
     if workflow.get("permissions") != expected_perms:
         violations.add("EXCESS_PERMISSION")
 
+    # 2. PR Trigger Safety
     trigger = workflow.get("trigger", "")
     if (event == "pull_request" and trigger != "pull_request") or (trigger == "pull_request_target"):
         violations.add("UNSAFE_PR_TRIGGER")
 
+    # 3. Test & Matrix Completion (Must strictly be True/False)
     if workflow.get("testsPassed") is not True or \
        workflow.get("matrixComplete") is not True or \
        workflow.get("failFast") is not False:
         violations.add("TESTS_INCOMPLETE")
 
+    # 4. Action Pinning
     hex_sha_regex = re.compile(r'^[a-f0-9]{40}$')
     for action in workflow.get("actions", []):
         if action.get("owner") != "actions":
             if not hex_sha_regex.fullmatch(action.get("ref", "")):
                 violations.add("MUTABLE_ACTION")
 
+    # 5. Image Stage
     if image.get("multiStage") is not True:
         violations.add("SINGLE_STAGE_IMAGE")
 
+    # 6. Image Root Runtime
     if image.get("runsAsRoot") is not False:
         violations.add("ROOT_RUNTIME")
 
+    # 7. Image Secrets
     if image.get("secretMode") not in ["none", "buildkit"]:
         violations.add("SECRET_IN_LAYER")
 
+    # 8. Critical Vulnerabilities
     if image.get("criticalVulnerabilities") != 0:
         violations.add("CRITICAL_CVE")
 
+    # 9. Pinned Image
     if image.get("digestPinned") is not True:
         violations.add("UNPINNED_IMAGE")
 
+    # 10. Production Overrides
     if target == "production":
         if event != "push" or ref != "refs/heads/main":
             violations.add("INVALID_PRODUCTION_REF")
@@ -101,13 +77,13 @@ async def release_gate(request: Request):
     return JSONResponse(content={"decision": decision, "violations": violations_list})
 
 @app.post("/action-firewall")
-@app.post("/action-firewall/")
 async def action_firewall(request: Request):
     try:
         payload = await request.json()
     except Exception:
         return JSONResponse(content={"decision": "block", "reason": "INVALID_SCHEMA"})
 
+    # 1. Top-Level Schema Check
     if not isinstance(payload, dict):
         return JSONResponse(content={"decision": "block", "reason": "INVALID_SCHEMA"})
         
@@ -120,10 +96,12 @@ async def action_firewall(request: Request):
     if not isinstance(args, dict):
         return JSONResponse(content={"decision": "block", "reason": "INVALID_SCHEMA"})
 
+    # 2. Tool Allowlist Check
     allowed_tools = {"search", "lookup_record", "send_email", "render_html"}
     if tool not in allowed_tools:
         return JSONResponse(content={"decision": "block", "reason": "TOOL_NOT_ALLOWED"})
 
+    # 3. Selected Tool's Argument Schema Check
     args_keys = set(args.keys())
     if tool == "search":
         if args_keys != {"query"} or not isinstance(args.get("query"), str):
@@ -145,36 +123,45 @@ async def action_firewall(request: Request):
         if args_keys != {"html"} or not isinstance(args.get("html"), str):
             return JSONResponse(content={"decision": "block", "reason": "INVALID_SCHEMA"})
 
+    # 4. Tenant Scope Check
     if tool == "lookup_record":
         if args["tenantId"] != "tenant-f9lp0ur":
             return JSONResponse(content={"decision": "block", "reason": "TENANT_SCOPE"})
 
+    # 5. Exact Email Domain Check
     if tool == "send_email":
         email = args["to"]
         if not email.endswith("@notify-sl77rjl.example") or email.split("@")[-1] != "notify-sl77rjl.example":
             return JSONResponse(content={"decision": "block", "reason": "EGRESS_DENIED"})
+
+    # 6. Human Approval Check
+    if tool == "send_email":
         if payload.get("humanApproved") is not True:
             return JSONResponse(content={"decision": "block", "reason": "APPROVAL_REQUIRED"})
 
+    # 7. HTML Safety Check
     if tool == "render_html":
         html_content = args["html"]
+        # Blocks <script>, <iframe>, inline event handlers (like onload=), and javascript: URLs
         unsafe_pattern = re.compile(r'(<\s*script|<\s*iframe|\bon[a-zA-Z]+\s*=|javascript\s*:)', re.IGNORECASE)
         if unsafe_pattern.search(html_content):
             return JSONResponse(content={"decision": "block", "reason": "UNSAFE_OUTPUT"})
 
+    # If all checks pass
     return JSONResponse(content={"decision": "allow", "reason": "ALLOW"})
 
 @app.post("/terraform/plan")
-@app.post("/terraform/plan/")
 async def terraform_plan(request: Request):
     try:
         payload = await request.json()
     except Exception:
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
 
+    # --- 1. Schema & Type Check ---
     if type(payload) is not dict:
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
 
+    # Check required top-level keys
     req_keys = {"environment", "state", "providerVersion", "destroyApproved", "resource"}
     if not req_keys.issubset(payload.keys()):
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
@@ -185,11 +172,13 @@ async def terraform_plan(request: Request):
     destroy_app = payload["destroyApproved"]
     res = payload["resource"]
 
+    # Strict type checks (type() is safer than isinstance() for bools/ints in Python)
     if type(env) is not str or type(state) is not dict or \
        type(prov_ver) is not str or type(destroy_app) is not bool or \
        type(res) is not dict:
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
 
+    # Check state keys
     if "backend" not in state or "locked" not in state:
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
     
@@ -198,6 +187,7 @@ async def terraform_plan(request: Request):
     if type(state_backend) is not str or type(state_locked) is not bool:
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
 
+    # Check resource keys
     res_keys = {"address", "type", "action", "labels", "secret", "forceDestroy"}
     if not res_keys.issubset(res.keys()):
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
@@ -213,22 +203,28 @@ async def terraform_plan(request: Request):
        type(r_labels) is not dict or type(r_force) is not bool:
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
     
+    # Secret must be explicitly None (null in JSON) or string
     if r_secret is not None and type(r_secret) is not str:
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
         
+    # Labels must be strictly string:string
     if any(type(k) is not str or type(v) is not str for k, v in r_labels.items()):
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
 
+    # THE FIX: Action must strictly be one of the enum values
     if r_action not in {"create", "update", "delete"}:
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
 
+    # --- 2. Environment Match ---
     if env != "prod-yj9jdn":
         return JSONResponse(content={"decision": "reject", "reason": "ENVIRONMENT_MISMATCH"})
 
+    # --- 3. State Safety ---
     valid_backends = {"gcs", "s3", "azurerm", "remote"}
     if state_backend not in valid_backends or state_locked is not True:
         return JSONResponse(content={"decision": "reject", "reason": "STATE_UNSAFE"})
 
+    # --- 4. Provider Version Pinning ---
     prov_ver_clean = prov_ver.strip()
     is_exact = re.match(r'^=?\s*\d+\.\d+(\.\d+)?$', prov_ver_clean)
     is_pessimistic = re.match(r'^~>\s*\d+\.\d+(\.\d+)?$', prov_ver_clean)
@@ -236,148 +232,208 @@ async def terraform_plan(request: Request):
     if not (is_exact or is_pessimistic):
         return JSONResponse(content={"decision": "reject", "reason": "UNPINNED_PROVIDER"})
 
+    # --- 5. Missing Labels ---
     req_labels = {"owner": "student-aa0jh", "environment": "production", "cost_center": "cc-h3sz"}
     for k, v in req_labels.items():
         if r_labels.get(k) != v:
             return JSONResponse(content={"decision": "reject", "reason": "MISSING_LABELS"})
 
+    # --- 6. Plaintext Secret ---
     if r_secret is not None:
         if not r_secret.startswith("secret://") or len(r_secret) == len("secret://"):
             return JSONResponse(content={"decision": "reject", "reason": "PLAINTEXT_SECRET"})
 
+    # --- 7. Delete Not Approved ---
     critical_resources = {"storage_bucket", "sql_database", "persistent_disk"}
     if r_action == "delete" and r_type in critical_resources:
         if destroy_app is not True:
             return JSONResponse(content={"decision": "reject", "reason": "DELETE_NOT_APPROVED"})
 
+    # --- 8. Force Destroy ---
     if r_type == "storage_bucket" and r_force is True:
         return JSONResponse(content={"decision": "reject", "reason": "FORCE_DESTROY"})
 
+    # --- Pass ---
     return JSONResponse(content={"decision": "approve", "reason": "APPROVE"})
 
 
-# --- OWASP LLM05 Firewall ---
-ALLOWED_HOSTS = frozenset({"cdn-ox5ugw7.example", "app-xwwtkl4.example"})
-CHANNELS = frozenset({"html", "markdown", "url", "sql", "shell"})
-MAX_OUTPUT = 20000
+# =====================================================================
+#  LLM Output Handling Gate  –  OWASP LLM05
+#  POST /sanitize-output
+# =====================================================================
 
-SCRIPT_TAG_RE = re.compile(r"<\s*(?:script|iframe|object|embed)\b", re.I)
-EVENT_HANDLER_RE = re.compile(r"[\s\"'/]on[a-z]+\s*=", re.I)
-LITERAL_SCHEME_RE = re.compile(r"(?:javascript|data|vbscript)\s*:", re.I)
-SAFE_URL_SCHEMES = frozenset({"http", "https"})
-HTML_URL_RE = re.compile(r"""(?:src|href)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`]+))""", re.I)
-MARKDOWN_URL_RE = re.compile(r"\]\(([^)]*)\)")
-SQL_METACHAR_RE = re.compile(r"""['";]|--|/\*|\bunion\b|\bor\s+1\s*=\s*1""", re.I)
-SHELL_METACHAR_RE = re.compile(r"[;&|`<>]|\$\(|\$\{")
+ALLOWED_HOSTS = {"cdn-ox5ugw7.example", "app-xwwtkl4.example"}
+VALID_CHANNELS = {"html", "markdown", "url", "sql", "shell"}
 
-_NAMED_ENTITIES = {"lt": "<", "gt": ">", "quot": '"', "apos": "'", "amp": "&"}
-ENTITY_RE = re.compile(r"&#x([0-9a-fA-F]+);|&#(\d+);|&(lt|gt|quot|apos|amp);")
-UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+# ── Decoding helpers ─────────────────────────────────────────────────
 
-def _entity_sub(match):
-    hex_digits, dec_digits, name = match.group(1), match.group(2), match.group(3)
+def decode_percent_escapes(s: str) -> str:
+    """Decode %XX sequences. Unlike urllib.unquote this never throws."""
+    return re.sub(
+        r'%([0-9A-Fa-f]{2})',
+        lambda m: chr(int(m.group(1), 16)),
+        s
+    )
+
+def decode_html_entities(s: str) -> str:
+    """Decode &#NN; &#xNN; and the five named entities. &amp; decoded LAST."""
+    s = re.sub(r'&#x([0-9A-Fa-f]+);', lambda m: chr(int(m.group(1), 16)), s, flags=re.IGNORECASE)
+    s = re.sub(r'&#(\d+);', lambda m: chr(int(m.group(1))), s)
+    s = s.replace('&lt;', '<')
+    s = s.replace('&gt;', '>')
+    s = s.replace('&quot;', '"')
+    s = s.replace('&apos;', "'")
+    s = s.replace('&amp;', '&')
+    return s
+
+def decode_unicode_escapes(s: str) -> str:
+    """Decode \\uXXXX sequences."""
+    return re.sub(
+        r'\\u([0-9A-Fa-f]{4})',
+        lambda m: chr(int(m.group(1), 16)),
+        s,
+        flags=re.IGNORECASE
+    )
+
+def full_decode(s: str) -> str:
+    """Single-pass decode: percent → HTML entities → \\uXXXX."""
+    r = decode_percent_escapes(s)
+    r = decode_html_entities(r)
+    r = decode_unicode_escapes(r)
+    return r
+
+# ── Detection checks ─────────────────────────────────────────────────
+
+def has_script_tag(text: str) -> bool:
+    return bool(re.search(r'<\s*(script|iframe|object|embed)\b', text, re.IGNORECASE))
+
+def has_event_handler(text: str) -> bool:
+    return bool(re.search(r'\bon[a-z]+\s*=', text, re.IGNORECASE))
+
+def has_dangerous_scheme_in_text(text: str) -> bool:
+    return bool(re.search(r'(javascript|data|vbscript)\s*:', text, re.IGNORECASE))
+
+def is_absolute_url(u: str) -> bool:
+    return bool(re.match(r'^[a-zA-Z][a-zA-Z0-9+\-.]*:', u)) or u.startswith('//')
+
+def safe_parse_url(u: str):
+    """Parse a URL string, resolving protocol-relative as https."""
     try:
-        if hex_digits is not None:
-            return chr(int(hex_digits, 16))
-        if dec_digits is not None:
-            return chr(int(dec_digits))
-    except (ValueError, OverflowError):
-        return match.group(0)
-    return _NAMED_ENTITIES[name]
-
-def _unicode_sub(match):
-    try:
-        return chr(int(match.group(1), 16))
-    except (ValueError, OverflowError):
-        return match.group(0)
-
-def _decode_once(text):
-    decoded = unquote(text)
-    decoded = ENTITY_RE.sub(_entity_sub, decoded)
-    decoded = UNICODE_ESCAPE_RE.sub(_unicode_sub, decoded)
-    return decoded
-
-def _extract_urls(channel, text):
-    if channel == "html":
-        return [double or single or bare for double, single, bare in HTML_URL_RE.findall(text)]
-    if channel == "markdown":
-        targets = []
-        for raw in MARKDOWN_URL_RE.findall(text):
-            target = raw.strip()
-            if not target: continue
-            target = target.split()[0]
-            if target.startswith("<") and target.endswith(">"):
-                target = target[1:-1]
-            targets.append(target)
-        return targets
-    if channel == "url":
-        stripped = text.strip()
-        return [stripped] if stripped else []
-    return []
-
-def _split(url):
-    try:
-        return urlsplit(url)
-    except ValueError:
+        if u.startswith('//'):
+            return urlparse('https:' + u)
+        return urlparse(u)
+    except Exception:
         return None
 
-def _bad_scheme(url):
-    parts = _split(url)
-    if parts is None: return True
-    return bool(parts.scheme) and parts.scheme.lower() not in SAFE_URL_SCHEMES
+def extract_urls(channel: str, text: str) -> list:
+    urls = []
+    if channel == 'html':
+        for m in re.finditer(r'''(?:src|href)\s*=\s*(["'])([\s\S]*?)\1''', text, re.IGNORECASE):
+            urls.append(m.group(2))
+    elif channel == 'markdown':
+        for m in re.finditer(r'\]\(([^)]*)\)', text):
+            url = m.group(1).strip()
+            sp = url.find(' ')
+            if sp != -1:
+                url = url[:sp]
+            urls.append(url)
+    elif channel == 'url':
+        urls.append(text.strip())
+    return urls
 
-def _external_host(url):
-    candidate = "https:" + url if url.startswith("//") else url
-    parts = _split(candidate)
-    if parts is None: return True
-    if not parts.scheme and not parts.netloc: return False
-    if not parts.netloc: return False
-    host = (parts.hostname or "").lower().rstrip(".")
-    if not host: return True
-    return host not in ALLOWED_HOSTS
+def check_dangerous_scheme(channel: str, text: str) -> bool:
+    if has_dangerous_scheme_in_text(text):
+        return True
+    for u in extract_urls(channel, text):
+        if not is_absolute_url(u):
+            continue
+        parsed = safe_parse_url(u)
+        if parsed and parsed.scheme:
+            scheme = parsed.scheme.lower()
+            if scheme not in ('http', 'https'):
+                return True
+    return False
 
-def _check_dangerous_scheme(text, urls):
-    if LITERAL_SCHEME_RE.search(text): return "DANGEROUS_SCHEME"
-    for url in urls:
-        if _bad_scheme(url): return "DANGEROUS_SCHEME"
+def check_external_exfil(channel: str, text: str) -> bool:
+    for u in extract_urls(channel, text):
+        if not is_absolute_url(u):
+            continue
+        parsed = safe_parse_url(u)
+        if parsed and parsed.hostname:
+            host = parsed.hostname.lower()
+            if host not in ALLOWED_HOSTS:
+                return True
+    return False
+
+def check_sql_metachar(text: str) -> bool:
+    if re.search(r"""['";]""", text):
+        return True
+    if '--' in text:
+        return True
+    if '/*' in text:
+        return True
+    if re.search(r'\bunion\b', text, re.IGNORECASE):
+        return True
+    if re.search(r'\bor\s+1\s*=\s*1', text, re.IGNORECASE):
+        return True
+    return False
+
+def check_shell_metachar(text: str) -> bool:
+    if re.search(r'[;&|`<>]', text):
+        return True
+    if '$(' in text:
+        return True
+    if '${' in text:
+        return True
+    return False
+
+# ── Channel violation dispatcher ─────────────────────────────────────
+
+def get_channel_violation(channel: str, text: str):
+    if channel == 'html':
+        if has_script_tag(text):                    return 'SCRIPT_TAG'
+        if has_event_handler(text):                 return 'EVENT_HANDLER'
+        if check_dangerous_scheme(channel, text):   return 'DANGEROUS_SCHEME'
+        if check_external_exfil(channel, text):     return 'EXTERNAL_EXFIL'
+    elif channel in ('markdown', 'url'):
+        if check_dangerous_scheme(channel, text):   return 'DANGEROUS_SCHEME'
+        if check_external_exfil(channel, text):     return 'EXTERNAL_EXFIL'
+    elif channel == 'sql':
+        if check_sql_metachar(text):                return 'SQL_METACHAR'
+    elif channel == 'shell':
+        if check_shell_metachar(text):              return 'SHELL_METACHAR'
     return None
 
-def _check_external_exfil(urls):
-    for url in urls:
-        if _external_host(url): return "EXTERNAL_EXFIL"
-    return None
-
-def _channel_reason(channel, text):
-    if channel == "sql": return "SQL_METACHAR" if SQL_METACHAR_RE.search(text) else "SAFE"
-    if channel == "shell": return "SHELL_METACHAR" if SHELL_METACHAR_RE.search(text) else "SAFE"
-    if channel == "html":
-        if SCRIPT_TAG_RE.search(text): return "SCRIPT_TAG"
-        if EVENT_HANDLER_RE.search(text): return "EVENT_HANDLER"
-    
-    urls = _extract_urls(channel, text)
-    return _check_dangerous_scheme(text, urls) or _check_external_exfil(urls) or "SAFE"
-
-def evaluate(body):
-    if type(body) is not dict: return "INVALID_SCHEMA"
-    channel = body.get("channel")
-    output = body.get("output")
-    if type(channel) is not str or channel not in CHANNELS: return "INVALID_SCHEMA"
-    if type(output) is not str or len(output) > MAX_OUTPUT: return "INVALID_SCHEMA"
-    
-    decoded = _decode_once(output)
-    if decoded != output and _channel_reason(channel, decoded) != "SAFE":
-        return "ENCODED_PAYLOAD"
-        
-    return _channel_reason(channel, output)
+# ── Endpoint ─────────────────────────────────────────────────────────
 
 @app.post("/sanitize-output")
-@app.post("/sanitize-output/")
 async def sanitize_output(request: Request):
     try:
-        body_bytes = await request.body()
-        payload = json.loads(body_bytes)
-        reason = evaluate(payload)
+        body = await request.json()
     except Exception:
-        reason = "INVALID_SCHEMA"
-        
-    return JSONResponse(content={"safe": reason == "SAFE", "reason": reason})
+        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
+
+    # Rule 1: INVALID_SCHEMA
+    if not isinstance(body, dict):
+        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
+    channel = body.get("channel")
+    output = body.get("output")
+    if channel not in VALID_CHANNELS:
+        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
+    if not isinstance(output, str):
+        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
+    if len(output) > 20000:
+        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
+
+    # Rule 2: ENCODED_PAYLOAD
+    decoded = full_decode(output)
+    if decoded != output:
+        if get_channel_violation(channel, decoded):
+            return JSONResponse(content={"safe": False, "reason": "ENCODED_PAYLOAD"})
+
+    # Rule 3: Channel rules on original output
+    violation = get_channel_violation(channel, output)
+    if violation:
+        return JSONResponse(content={"safe": False, "reason": violation})
+
+    return JSONResponse(content={"safe": True, "reason": "SAFE"})
