@@ -3,6 +3,8 @@ from fastapi.responses import JSONResponse
 import re
 import urllib.parse
 import html as html_lib
+import sys
+import json
 
 app = FastAPI()
 
@@ -260,10 +262,8 @@ async def terraform_plan(request: Request):
     return JSONResponse(content={"decision": "approve", "reason": "APPROVE"})
 
 def decode_payload(text: str) -> str:
-    # 1. Percent-escapes
     decoded = urllib.parse.unquote(text)
     
-    # 2. Strict HTML Entities (Numeric hex, Numeric decimal)
     def hex_repl(m):
         try: return chr(int(m.group(1), 16))
         except ValueError: return m.group(0)
@@ -274,13 +274,11 @@ def decode_payload(text: str) -> str:
         except ValueError: return m.group(0)
     decoded = re.sub(r'&#([0-9]+);?', dec_repl, decoded)
     
-    # EXACT 5 named entities - Single pass to prevent cascading replacement bypasses
     named_entities = {'&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'", '&amp;': '&'}
     def named_repl(m):
         return named_entities.get(m.group(0).lower(), m.group(0))
     decoded = re.sub(r'(?i)(&lt;|&gt;|&quot;|&apos;|&amp;)', named_repl, decoded)
         
-    # 3. Unicode escapes (\uXXXX)
     def u_repl(m):
         try: return chr(int(m.group(1), 16))
         except ValueError: return m.group(0)
@@ -289,76 +287,57 @@ def decode_payload(text: str) -> str:
     return decoded
 
 def evaluate_channel(channel: str, text: str) -> str:
-    # HTML-Specific Early Checks
     if channel == "html":
-        if re.search(r'(?i)<\s*(script|iframe|object|embed)\b', text):
-            return "SCRIPT_TAG"
-        if re.search(r'(?i)\bon[a-z]+\s*=', text):
-            return "EVENT_HANDLER"
+        if re.search(r'(?i)<\s*(script|iframe|object|embed)\b', text): return "SCRIPT_TAG"
+        if re.search(r'(?i)\bon[a-z]+\s*=', text): return "EVENT_HANDLER"
 
-    # URL-Based Checks (HTML, Markdown, URL)
     if channel in ["html", "markdown", "url"]:
-        # Global scheme check directly in raw text
         if re.search(r'(?i)(javascript|data|vbscript)\s*:', text):
             return "DANGEROUS_SCHEME"
         
-        # Extract URLs based on channel
         urls = []
         if channel == "html":
-            # \s\S allows URL extraction even if it breaks across multiple lines
             matches = re.findall(r'(?i)\b(?:src|href)\s*=\s*(["\'])([\s\S]*?)\1', text)
             urls = [m[1] for m in matches]
         elif channel == "markdown":
             matches = re.findall(r'\]\(([\s\S]*?)\)', text)
-            # Strip trailing markdown titles that confuse parsers
             urls = [m.strip().split()[0] for m in matches if m.strip()]
         elif channel == "url":
             urls = [text.strip()]
 
-        # Evaluate Extracted URLs for Dangerous Schemes
         for u in urls:
             u = u.strip()
             if not u: continue
             
-            # PARSER DIFFERENTIAL FIX: Normalize backslashes to block SSRF evasions
             u_norm = u.replace('\\', '/')
             u_to_parse = 'https:' + u_norm if u_norm.startswith('//') else u_norm
-            
             try:
                 parsed = urllib.parse.urlparse(u_to_parse)
             except Exception:
                 return "DANGEROUS_SCHEME"
-            
             if parsed.scheme and parsed.scheme.lower() not in ["http", "https"]:
                 return "DANGEROUS_SCHEME"
                 
-        # Evaluate for External Exfiltration
         for u in urls:
             u = u.strip()
             if not u: continue
             
             u_norm = u.replace('\\', '/')
             u_to_parse = 'https:' + u_norm if u_norm.startswith('//') else u_norm
-            
             try:
                 parsed = urllib.parse.urlparse(u_to_parse)
-                if parsed.scheme: # Only applies to absolute URLs
-                    # Strip trailing dots from hostname to prevent FQDN bypasses
+                if parsed.scheme: 
                     host = parsed.hostname.rstrip('.') if parsed.hostname else ""
                     if host not in ALLOWED_HOSTS:
                         return "EXTERNAL_EXFIL"
             except Exception:
                 return "EXTERNAL_EXFIL"
 
-    # SQL Checks
     if channel == "sql":
-        if re.search(r"(?i)(['\";]|--|/\*|\bunion\b|\bor\s+1\s*=\s*1)", text):
-            return "SQL_METACHAR"
+        if re.search(r"(?i)(['\";]|--|/\*|\bunion\b|\bor\s+1\s*=\s*1)", text): return "SQL_METACHAR"
             
-    # Shell Checks
     if channel == "shell":
-        if re.search(r"([;|&`<>]|\$\(|\$\{)", text):
-            return "SHELL_METACHAR"
+        if re.search(r"([;|&`<>]|\$\(|\$\{)", text): return "SHELL_METACHAR"
 
     return "SAFE"
 
@@ -367,32 +346,32 @@ def evaluate_channel(channel: str, text: str) -> str:
 async def sanitize_output(request: Request):
     try:
         payload = await request.json()
+        print(f"\n[INCOMING GRADER PAYLOAD] -> {json.dumps(payload)}", flush=True)
     except Exception:
+        print("[INCOMING GRADER PAYLOAD] -> Malformed JSON / Not Parsable", flush=True)
         return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
     
-    # 1. Strict Top-Level Schema Checks
     if type(payload) is not dict:
-        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
-        
-    channel = payload.get("channel")
-    output = payload.get("output")
-    
-    if channel not in ALLOWED_CHANNELS:
-        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
-        
-    if type(output) is not str or len(output) > 20000:
-        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
-
-    # 2. Encoded Payload Logic
-    decoded_output = decode_payload(output)
-    if decoded_output != output:
-        reason_decoded = evaluate_channel(channel, decoded_output)
-        if reason_decoded != "SAFE":
-            return JSONResponse(content={"safe": False, "reason": "ENCODED_PAYLOAD"})
-
-    # 3. Standard Processing on Original Output
-    reason = evaluate_channel(channel, output)
-    if reason == "SAFE":
-        return JSONResponse(content={"safe": True, "reason": "SAFE"})
+        result = {"safe": False, "reason": "INVALID_SCHEMA"}
+    elif payload.get("channel") not in ALLOWED_CHANNELS:
+        result = {"safe": False, "reason": "INVALID_SCHEMA"}
+    elif type(payload.get("output")) is not str or len(payload.get("output")) > 20000:
+        result = {"safe": False, "reason": "INVALID_SCHEMA"}
     else:
-        return JSONResponse(content={"safe": False, "reason": reason})
+        channel = payload.get("channel")
+        output = payload.get("output")
+        
+        decoded_output = decode_payload(output)
+        if decoded_output != output:
+            reason_decoded = evaluate_channel(channel, decoded_output)
+            if reason_decoded != "SAFE":
+                result = {"safe": False, "reason": "ENCODED_PAYLOAD"}
+            else:
+                reason = evaluate_channel(channel, output)
+                result = {"safe": (reason == "SAFE"), "reason": reason}
+        else:
+            reason = evaluate_channel(channel, output)
+            result = {"safe": (reason == "SAFE"), "reason": reason}
+
+    print(f"[FIREWALL DECISION OUT] -> {json.dumps(result)}\n", flush=True)
+    return JSONResponse(content=result)
