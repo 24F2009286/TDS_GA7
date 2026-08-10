@@ -11,6 +11,30 @@ app = FastAPI()
 ALLOWED_HOSTS = {"cdn-ox5ugw7.example", "app-xwwtkl4.example"}
 ALLOWED_CHANNELS = {"html", "markdown", "url", "sql", "shell"}
 
+@app.middleware("http")
+async def limit_payload_size(request: Request, call_next):
+    # Only enforce this on the specific firewall endpoint
+    if request.url.path == "/sanitize-output":
+        # Check Content-Length header if provided
+        content_length = request.headers.get('content-length')
+        if content_length and int(content_length) > 50000: # 50KB is well above the 20K char limit
+            return JSONResponse(status_code=200, content={"safe": False, "reason": "INVALID_SCHEMA"})
+        
+        # If no header, read the body chunks to prevent streaming DoS
+        body = b""
+        async for chunk in request.stream():
+            body += chunk
+            if len(body) > 50000:
+                return JSONResponse(status_code=200, content={"safe": False, "reason": "INVALID_SCHEMA"})
+        
+        # Reconstruct the request so FastAPI can still parse it normally if it's safe
+        async def receive():
+            return {"type": "http.request", "body": body}
+        request._receive = receive
+        
+    response = await call_next(request)
+    return response
+
 @app.post("/release-gate")
 async def release_gate(request: Request):
     try:
