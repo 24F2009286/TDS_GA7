@@ -4,6 +4,8 @@ from fastapi.middleware.cors import CORSMiddleware
 import re
 from urllib.parse import unquote, urlsplit
 import json
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 app = FastAPI()
 
@@ -14,6 +16,23 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# --- GLOBAL EXCEPTION TRAPS ---
+# Force all protocol errors (404 Not Found, 405 Method Not Allowed) to return the exact assignment schema
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    print(f"[TRAPPED HTTP {exc.status_code}] -> {request.method} {request.url.path}")
+    return JSONResponse(status_code=200, content={"safe": False, "reason": "INVALID_SCHEMA"})
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    print("[TRAPPED 422 VALIDATION ERROR]")
+    return JSONResponse(status_code=200, content={"safe": False, "reason": "INVALID_SCHEMA"})
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    print(f"[TRAPPED 500 FATAL ERROR] -> {str(exc)}")
+    return JSONResponse(status_code=200, content={"safe": False, "reason": "INVALID_SCHEMA"})
 
 @app.get("/")
 @app.head("/")
