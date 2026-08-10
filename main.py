@@ -262,10 +262,28 @@ async def terraform_plan(request: Request):
 def decode_payload(text: str) -> str:
     # 1. Percent-escapes
     decoded = urllib.parse.unquote(text)
-    # 2. HTML entities
-    decoded = html_lib.unescape(decoded)
+    
+    # 2. Strict HTML Entities (Numeric hex, Numeric decimal, and exact 5 Named)
+    def hex_repl(m):
+        try: return chr(int(m.group(1), 16))
+        except ValueError: return m.group(0)
+    decoded = re.sub(r'(?i)&#x([0-9a-f]+);', hex_repl, decoded)
+    
+    def dec_repl(m):
+        try: return chr(int(m.group(1)))
+        except ValueError: return m.group(0)
+    decoded = re.sub(r'&#([0-9]+);', dec_repl, decoded)
+    
+    named_entities = {'&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'", '&amp;': '&'}
+    for k, v in named_entities.items():
+        decoded = decoded.replace(k, v)
+        
     # 3. Unicode escapes (\uXXXX)
-    decoded = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), decoded)
+    def u_repl(m):
+        try: return chr(int(m.group(1), 16))
+        except ValueError: return m.group(0)
+    decoded = re.sub(r'\\u([0-9a-fA-F]{4})', u_repl, decoded)
+    
     return decoded
 
 def evaluate_channel(channel: str, text: str) -> str:
@@ -285,40 +303,47 @@ def evaluate_channel(channel: str, text: str) -> str:
         # Extract URLs based on channel
         urls = []
         if channel == "html":
-            matches = re.findall(r'(?i)(?:src|href)\s*=\s*(["\'])(.*?)\1', text)
+            # \b prevents matching notsrc="..."
+            matches = re.findall(r'(?i)\b(?:src|href)\s*=\s*(["\'])(.*?)\1', text)
             urls = [m[1] for m in matches]
         elif channel == "markdown":
-            urls = re.findall(r'\]\((.*?)\)', text)
+            matches = re.findall(r'\]\(([^)]*)\)', text)
+            urls = matches
         elif channel == "url":
             urls = [text.strip()]
 
-        # Evaluate Extracted URLs for Dangerous Schemes
+        # Evaluate Extracted URLs
         for u in urls:
             u = u.strip()
             if not u: continue
             
             u_to_parse = 'https:' + u if u.startswith('//') else u
-            parsed = urllib.parse.urlparse(u_to_parse)
+            try:
+                parsed = urllib.parse.urlparse(u_to_parse)
+            except ValueError:
+                # If the URL is so malformed it crashes the parser, flag it
+                return "DANGEROUS_SCHEME"
             
             if parsed.scheme and parsed.scheme.lower() not in ["http", "https"]:
                 return "DANGEROUS_SCHEME"
                 
-        # Evaluate Extracted URLs for External Exfiltration
+        # Evaluate for External Exfiltration
         for u in urls:
             u = u.strip()
             if not u: continue
             
             u_to_parse = 'https:' + u if u.startswith('//') else u
-            parsed = urllib.parse.urlparse(u_to_parse)
-            
-            # If it has a scheme, it is considered an absolute URL
-            if parsed.scheme:
-                if parsed.hostname not in ALLOWED_HOSTS:
-                    return "EXTERNAL_EXFIL"
+            try:
+                parsed = urllib.parse.urlparse(u_to_parse)
+                if parsed.scheme: # Only applies to absolute URLs
+                    if parsed.hostname not in ALLOWED_HOSTS:
+                        return "EXTERNAL_EXFIL"
+            except ValueError:
+                return "EXTERNAL_EXFIL"
 
     # SQL Checks
     if channel == "sql":
-        if re.search(r"(?i)(['\";]|--|/\*|\bunion\b|or\s+1\s*=\s*1)", text):
+        if re.search(r"(?i)(['\";]|--|/\*|\bunion\b|\bor\s+1\s*=\s*1)", text):
             return "SQL_METACHAR"
             
     # Shell Checks
@@ -328,6 +353,7 @@ def evaluate_channel(channel: str, text: str) -> str:
 
     return "SAFE"
 
+
 @app.post("/sanitize-output")
 async def sanitize_output(request: Request):
     try:
@@ -335,7 +361,7 @@ async def sanitize_output(request: Request):
     except Exception:
         return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
     
-    # 1. Top-Level Schema Checks
+    # 1. Strict Top-Level Schema Checks
     if type(payload) is not dict:
         return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
         
@@ -348,7 +374,7 @@ async def sanitize_output(request: Request):
     if type(output) is not str or len(output) > 20000:
         return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
 
-    # 2. Encoded Payload Check
+    # 2. Encoded Payload Logic
     decoded_output = decode_payload(output)
     if decoded_output != output:
         reason_decoded = evaluate_channel(channel, decoded_output)
