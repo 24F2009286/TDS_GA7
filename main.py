@@ -263,8 +263,7 @@ def decode_payload(text: str) -> str:
     # 1. Percent-escapes
     decoded = urllib.parse.unquote(text)
     
-    # 2. Strict HTML Entities (Numeric hex, Numeric decimal, and exact 5 Named)
-    # The '?' makes the semicolon optional, catching WAF-bypass payloads.
+    # 2. Strict HTML Entities (Numeric hex, Numeric decimal)
     def hex_repl(m):
         try: return chr(int(m.group(1), 16))
         except ValueError: return m.group(0)
@@ -275,15 +274,17 @@ def decode_payload(text: str) -> str:
         except ValueError: return m.group(0)
     decoded = re.sub(r'&#([0-9]+);?', dec_repl, decoded)
     
+    # EXACT 5 named entities - Single pass to prevent cascading replacement bypasses
     named_entities = {'&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'", '&amp;': '&'}
-    for k, v in named_entities.items():
-        decoded = decoded.replace(k, v)
+    def named_repl(m):
+        return named_entities.get(m.group(0).lower(), m.group(0))
+    decoded = re.sub(r'(?i)(&lt;|&gt;|&quot;|&apos;|&amp;)', named_repl, decoded)
         
     # 3. Unicode escapes (\uXXXX)
     def u_repl(m):
         try: return chr(int(m.group(1), 16))
         except ValueError: return m.group(0)
-    decoded = re.sub(r'\\u([0-9a-fA-F]{4})', u_repl, decoded)
+    decoded = re.sub(r'(?i)\\u([0-9a-f]{4})', u_repl, decoded)
     
     return decoded
 
@@ -304,11 +305,12 @@ def evaluate_channel(channel: str, text: str) -> str:
         # Extract URLs based on channel
         urls = []
         if channel == "html":
-            matches = re.findall(r'(?i)\b(?:src|href)\s*=\s*(["\'])(.*?)\1', text)
+            # \s\S allows URL extraction even if it breaks across multiple lines
+            matches = re.findall(r'(?i)\b(?:src|href)\s*=\s*(["\'])([\s\S]*?)\1', text)
             urls = [m[1] for m in matches]
         elif channel == "markdown":
-            matches = re.findall(r'\]\(([^)]*)\)', text)
-            # Split by whitespace to drop malicious or benign Markdown titles
+            matches = re.findall(r'\]\(([\s\S]*?)\)', text)
+            # Strip trailing markdown titles that confuse parsers
             urls = [m.strip().split()[0] for m in matches if m.strip()]
         elif channel == "url":
             urls = [text.strip()]
@@ -318,10 +320,13 @@ def evaluate_channel(channel: str, text: str) -> str:
             u = u.strip()
             if not u: continue
             
-            u_to_parse = 'https:' + u if u.startswith('//') else u
+            # PARSER DIFFERENTIAL FIX: Normalize backslashes to block SSRF evasions
+            u_norm = u.replace('\\', '/')
+            u_to_parse = 'https:' + u_norm if u_norm.startswith('//') else u_norm
+            
             try:
                 parsed = urllib.parse.urlparse(u_to_parse)
-            except ValueError:
+            except Exception:
                 return "DANGEROUS_SCHEME"
             
             if parsed.scheme and parsed.scheme.lower() not in ["http", "https"]:
@@ -332,13 +337,17 @@ def evaluate_channel(channel: str, text: str) -> str:
             u = u.strip()
             if not u: continue
             
-            u_to_parse = 'https:' + u if u.startswith('//') else u
+            u_norm = u.replace('\\', '/')
+            u_to_parse = 'https:' + u_norm if u_norm.startswith('//') else u_norm
+            
             try:
                 parsed = urllib.parse.urlparse(u_to_parse)
                 if parsed.scheme: # Only applies to absolute URLs
-                    if parsed.hostname not in ALLOWED_HOSTS:
+                    # Strip trailing dots from hostname to prevent FQDN bypasses
+                    host = parsed.hostname.rstrip('.') if parsed.hostname else ""
+                    if host not in ALLOWED_HOSTS:
                         return "EXTERNAL_EXFIL"
-            except ValueError:
+            except Exception:
                 return "EXTERNAL_EXFIL"
 
     # SQL Checks
