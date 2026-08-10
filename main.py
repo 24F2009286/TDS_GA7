@@ -147,3 +147,95 @@ async def action_firewall(request: Request):
 
     # If all checks pass
     return JSONResponse(content={"decision": "allow", "reason": "ALLOW"})
+
+@app.post("/terraform/plan")
+async def terraform_plan(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
+
+    # --- 1. Schema & Type Check ---
+    if not isinstance(payload, dict):
+        return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
+
+    env = payload.get("environment")
+    state = payload.get("state")
+    prov_ver = payload.get("providerVersion")
+    destroy_app = payload.get("destroyApproved")
+    res = payload.get("resource")
+
+    # Top-level types
+    if not isinstance(env, str) or not isinstance(state, dict) or \
+       not isinstance(prov_ver, str) or not isinstance(destroy_app, bool) or \
+       not isinstance(res, dict):
+        return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
+
+    # State types
+    state_backend = state.get("backend")
+    state_locked = state.get("locked")
+    if not isinstance(state_backend, str) or not isinstance(state_locked, bool):
+        return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
+
+    # Resource types
+    r_addr = res.get("address")
+    r_type = res.get("type")
+    r_action = res.get("action")
+    r_labels = res.get("labels")
+    r_secret = res.get("secret")
+    r_force = res.get("forceDestroy")
+
+    if not isinstance(r_addr, str) or not isinstance(r_type, str) or \
+       not isinstance(r_action, str) or not isinstance(r_labels, dict) or \
+       not isinstance(r_force, bool):
+        return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
+    
+    # Secret can be null or string
+    if r_secret is not None and not isinstance(r_secret, str):
+        return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
+        
+    # Labels must be string:string mappings
+    if any(not isinstance(k, str) or not isinstance(v, str) for k, v in r_labels.items()):
+        return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
+
+    # --- 2. Environment Match ---
+    if env != "prod-yj9jdn":
+        return JSONResponse(content={"decision": "reject", "reason": "ENVIRONMENT_MISMATCH"})
+
+    # --- 3. State Safety ---
+    valid_backends = {"gcs", "s3", "azurerm", "remote"}
+    if state_backend not in valid_backends or state_locked is not True:
+        return JSONResponse(content={"decision": "reject", "reason": "STATE_UNSAFE"})
+
+    # --- 4. Provider Version Pinning ---
+    prov_ver_clean = prov_ver.strip()
+    is_exact = re.match(r'^=?\s*\d+\.\d+(\.\d+)?$', prov_ver_clean)
+    is_pessimistic = re.match(r'^~>\s*\d+\.\d+(\.\d+)?$', prov_ver_clean)
+    
+    if not (is_exact or is_pessimistic):
+        return JSONResponse(content={"decision": "reject", "reason": "UNPINNED_PROVIDER"})
+
+    # --- 5. Missing Labels ---
+    req_labels = {"owner": "student-aa0jh", "environment": "production", "cost_center": "cc-h3sz"}
+    for k, v in req_labels.items():
+        if r_labels.get(k) != v:
+            return JSONResponse(content={"decision": "reject", "reason": "MISSING_LABELS"})
+
+    # --- 6. Plaintext Secret ---
+    if r_secret is not None:
+        if not r_secret.startswith("secret://") or len(r_secret) == len("secret://"):
+            return JSONResponse(content={"decision": "reject", "reason": "PLAINTEXT_SECRET"})
+
+    # --- 7. Delete Not Approved ---
+    critical_resources = {"storage_bucket", "sql_database", "persistent_disk"}
+    if r_action == "delete" and r_type in critical_resources:
+        if destroy_app is not True:
+            return JSONResponse(content={"decision": "reject", "reason": "DELETE_NOT_APPROVED"})
+
+    # --- 8. Force Destroy ---
+    # The environment mismatch check (Rule 2) already proves this is the production environment.
+    if r_type == "storage_bucket" and r_force is True:
+        return JSONResponse(content={"decision": "reject", "reason": "FORCE_DESTROY"})
+
+    # --- Pass ---
+    return JSONResponse(content={"decision": "approve", "reason": "APPROVE"})
