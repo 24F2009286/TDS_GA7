@@ -73,3 +73,77 @@ async def release_gate(request: Request):
     decision = "promote" if not violations_list else "block"
     
     return JSONResponse(content={"decision": decision, "violations": violations_list})
+
+@app.post("/action-firewall")
+async def action_firewall(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse(content={"decision": "block", "reason": "INVALID_SCHEMA"})
+
+    # 1. Top-Level Schema Check
+    if not isinstance(payload, dict):
+        return JSONResponse(content={"decision": "block", "reason": "INVALID_SCHEMA"})
+        
+    action = payload.get("action")
+    if not isinstance(action, dict) or "tool" not in action or "args" not in action:
+        return JSONResponse(content={"decision": "block", "reason": "INVALID_SCHEMA"})
+
+    tool = action.get("tool")
+    args = action.get("args")
+    if not isinstance(args, dict):
+        return JSONResponse(content={"decision": "block", "reason": "INVALID_SCHEMA"})
+
+    # 2. Tool Allowlist Check
+    allowed_tools = {"search", "lookup_record", "send_email", "render_html"}
+    if tool not in allowed_tools:
+        return JSONResponse(content={"decision": "block", "reason": "TOOL_NOT_ALLOWED"})
+
+    # 3. Selected Tool's Argument Schema Check
+    args_keys = set(args.keys())
+    if tool == "search":
+        if args_keys != {"query"} or not isinstance(args.get("query"), str):
+            return JSONResponse(content={"decision": "block", "reason": "INVALID_SCHEMA"})
+        if not (1 <= len(args["query"]) <= 200):
+            return JSONResponse(content={"decision": "block", "reason": "INVALID_SCHEMA"})
+            
+    elif tool == "lookup_record":
+        if args_keys != {"tenantId", "recordId"} or not isinstance(args.get("tenantId"), str) or not isinstance(args.get("recordId"), str):
+            return JSONResponse(content={"decision": "block", "reason": "INVALID_SCHEMA"})
+        if len(args["recordId"]) == 0:
+            return JSONResponse(content={"decision": "block", "reason": "INVALID_SCHEMA"})
+            
+    elif tool == "send_email":
+        if args_keys != {"to", "subject", "body"} or not isinstance(args.get("to"), str) or not isinstance(args.get("subject"), str) or not isinstance(args.get("body"), str):
+            return JSONResponse(content={"decision": "block", "reason": "INVALID_SCHEMA"})
+            
+    elif tool == "render_html":
+        if args_keys != {"html"} or not isinstance(args.get("html"), str):
+            return JSONResponse(content={"decision": "block", "reason": "INVALID_SCHEMA"})
+
+    # 4. Tenant Scope Check
+    if tool == "lookup_record":
+        if args["tenantId"] != "tenant-f9lp0ur":
+            return JSONResponse(content={"decision": "block", "reason": "TENANT_SCOPE"})
+
+    # 5. Exact Email Domain Check
+    if tool == "send_email":
+        email = args["to"]
+        if not email.endswith("@notify-sl77rjl.example") or email.split("@")[-1] != "notify-sl77rjl.example":
+            return JSONResponse(content={"decision": "block", "reason": "EGRESS_DENIED"})
+
+    # 6. Human Approval Check
+    if tool == "send_email":
+        if payload.get("humanApproved") is not True:
+            return JSONResponse(content={"decision": "block", "reason": "APPROVAL_REQUIRED"})
+
+    # 7. HTML Safety Check
+    if tool == "render_html":
+        html_content = args["html"]
+        # Blocks <script>, <iframe>, inline event handlers (like onload=), and javascript: URLs
+        unsafe_pattern = re.compile(r'(<\s*script|<\s*iframe|\bon[a-zA-Z]+\s*=|javascript\s*:)', re.IGNORECASE)
+        if unsafe_pattern.search(html_content):
+            return JSONResponse(content={"decision": "block", "reason": "UNSAFE_OUTPUT"})
+
+    # If all checks pass
+    return JSONResponse(content={"decision": "allow", "reason": "ALLOW"})
