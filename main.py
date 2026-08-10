@@ -264,15 +264,16 @@ def decode_payload(text: str) -> str:
     decoded = urllib.parse.unquote(text)
     
     # 2. Strict HTML Entities (Numeric hex, Numeric decimal, and exact 5 Named)
+    # The '?' makes the semicolon optional, catching WAF-bypass payloads.
     def hex_repl(m):
         try: return chr(int(m.group(1), 16))
         except ValueError: return m.group(0)
-    decoded = re.sub(r'(?i)&#x([0-9a-f]+);', hex_repl, decoded)
+    decoded = re.sub(r'(?i)&#x([0-9a-f]+);?', hex_repl, decoded)
     
     def dec_repl(m):
         try: return chr(int(m.group(1)))
         except ValueError: return m.group(0)
-    decoded = re.sub(r'&#([0-9]+);', dec_repl, decoded)
+    decoded = re.sub(r'&#([0-9]+);?', dec_repl, decoded)
     
     named_entities = {'&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'", '&amp;': '&'}
     for k, v in named_entities.items():
@@ -296,23 +297,23 @@ def evaluate_channel(channel: str, text: str) -> str:
 
     # URL-Based Checks (HTML, Markdown, URL)
     if channel in ["html", "markdown", "url"]:
-        # Global scheme check directly in text
+        # Global scheme check directly in raw text
         if re.search(r'(?i)(javascript|data|vbscript)\s*:', text):
             return "DANGEROUS_SCHEME"
         
         # Extract URLs based on channel
         urls = []
         if channel == "html":
-            # \b prevents matching notsrc="..."
             matches = re.findall(r'(?i)\b(?:src|href)\s*=\s*(["\'])(.*?)\1', text)
             urls = [m[1] for m in matches]
         elif channel == "markdown":
             matches = re.findall(r'\]\(([^)]*)\)', text)
-            urls = matches
+            # Split by whitespace to drop malicious or benign Markdown titles
+            urls = [m.strip().split()[0] for m in matches if m.strip()]
         elif channel == "url":
             urls = [text.strip()]
 
-        # Evaluate Extracted URLs
+        # Evaluate Extracted URLs for Dangerous Schemes
         for u in urls:
             u = u.strip()
             if not u: continue
@@ -321,7 +322,6 @@ def evaluate_channel(channel: str, text: str) -> str:
             try:
                 parsed = urllib.parse.urlparse(u_to_parse)
             except ValueError:
-                # If the URL is so malformed it crashes the parser, flag it
                 return "DANGEROUS_SCHEME"
             
             if parsed.scheme and parsed.scheme.lower() not in ["http", "https"]:
