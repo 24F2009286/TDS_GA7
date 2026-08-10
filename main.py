@@ -2,12 +2,11 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import re
-import urllib.parse
+from urllib.parse import unquote, urlsplit
 import json
 
 app = FastAPI()
 
-# 1. Universal CORS to prevent pre-flight blockages from browser-based graders
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -16,7 +15,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Root health check for the grader's initial availability ping
 @app.get("/")
 @app.head("/")
 async def root_health_check():
@@ -240,120 +238,127 @@ async def terraform_plan(request: Request):
 
 
 # --- OWASP LLM05 Firewall ---
-ALLOWED_HOSTS = {"cdn-ox5ugw7.example", "app-xwwtkl4.example"}
-ALLOWED_CHANNELS = {"html", "markdown", "url", "sql", "shell"}
+ALLOWED_HOSTS = frozenset({"cdn-ox5ugw7.example", "app-xwwtkl4.example"})
+CHANNELS = frozenset({"html", "markdown", "url", "sql", "shell"})
+MAX_OUTPUT = 20000
 
-def decode_payload(text: str) -> str:
-    text = urllib.parse.unquote(text)
-    
-    # Single-pass evaluation prevents cascading double-decodes
-    def html_repl(m):
-        if m.group(1):
-            try: return chr(int(m.group(1), 16))
-            except ValueError: return m.group(0)
-        if m.group(2): 
-            try: return chr(int(m.group(2)))
-            except ValueError: return m.group(0)
-        if m.group(3): 
-            named = {'&lt;': '<', '&gt;': '>', '&quot;': '"', '&apos;': "'", '&amp;': '&'}
-            return named.get(m.group(3), m.group(0))
-        return m.group(0)
-        
-    pattern = r'&#x([0-9a-fA-F]+);|&#([0-9]+);|(&lt;|&gt;|&quot;|&apos;|&amp;)'
-    text = re.sub(pattern, html_repl, text)
-    
-    text = re.sub(r'(?i)\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), text)
-    return text
+SCRIPT_TAG_RE = re.compile(r"<\s*(?:script|iframe|object|embed)\b", re.I)
+EVENT_HANDLER_RE = re.compile(r"[\s\"'/]on[a-z]+\s*=", re.I)
+LITERAL_SCHEME_RE = re.compile(r"(?:javascript|data|vbscript)\s*:", re.I)
+SAFE_URL_SCHEMES = frozenset({"http", "https"})
+HTML_URL_RE = re.compile(r"""(?:src|href)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'<>`]+))""", re.I)
+MARKDOWN_URL_RE = re.compile(r"\]\(([^)]*)\)")
+SQL_METACHAR_RE = re.compile(r"""['";]|--|/\*|\bunion\b|\bor\s+1\s*=\s*1""", re.I)
+SHELL_METACHAR_RE = re.compile(r"[;&|`<>]|\$\(|\$\{")
 
-def evaluate_channel(channel: str, text: str) -> str:
+_NAMED_ENTITIES = {"lt": "<", "gt": ">", "quot": '"', "apos": "'", "amp": "&"}
+ENTITY_RE = re.compile(r"&#x([0-9a-fA-F]+);|&#(\d+);|&(lt|gt|quot|apos|amp);")
+UNICODE_ESCAPE_RE = re.compile(r"\\u([0-9a-fA-F]{4})")
+
+def _entity_sub(match):
+    hex_digits, dec_digits, name = match.group(1), match.group(2), match.group(3)
+    try:
+        if hex_digits is not None:
+            return chr(int(hex_digits, 16))
+        if dec_digits is not None:
+            return chr(int(dec_digits))
+    except (ValueError, OverflowError):
+        return match.group(0)
+    return _NAMED_ENTITIES[name]
+
+def _unicode_sub(match):
+    try:
+        return chr(int(match.group(1), 16))
+    except (ValueError, OverflowError):
+        return match.group(0)
+
+def _decode_once(text):
+    decoded = unquote(text)
+    decoded = ENTITY_RE.sub(_entity_sub, decoded)
+    decoded = UNICODE_ESCAPE_RE.sub(_unicode_sub, decoded)
+    return decoded
+
+def _extract_urls(channel, text):
     if channel == "html":
-        if re.search(r'(?i)<\s*(script|iframe|object|embed)\b', text):
-            return "SCRIPT_TAG"
-        if re.search(r'(?i)\bon[a-z]+\s*=', text):
-            return "EVENT_HANDLER"
+        return [double or single or bare for double, single, bare in HTML_URL_RE.findall(text)]
+    if channel == "markdown":
+        targets = []
+        for raw in MARKDOWN_URL_RE.findall(text):
+            target = raw.strip()
+            if not target: continue
+            target = target.split()[0]
+            if target.startswith("<") and target.endswith(">"):
+                target = target[1:-1]
+            targets.append(target)
+        return targets
+    if channel == "url":
+        stripped = text.strip()
+        return [stripped] if stripped else []
+    return []
 
-    if channel in ["html", "markdown", "url"]:
-        if re.search(r'(?i)(javascript|data|vbscript)\s*:', text):
-            return "DANGEROUS_SCHEME"
+def _split(url):
+    try:
+        return urlsplit(url)
+    except ValueError:
+        return None
+
+def _bad_scheme(url):
+    parts = _split(url)
+    if parts is None: return True
+    return bool(parts.scheme) and parts.scheme.lower() not in SAFE_URL_SCHEMES
+
+def _external_host(url):
+    candidate = "https:" + url if url.startswith("//") else url
+    parts = _split(candidate)
+    if parts is None: return True
+    if not parts.scheme and not parts.netloc: return False
+    if not parts.netloc: return False
+    host = (parts.hostname or "").lower().rstrip(".")
+    if not host: return True
+    return host not in ALLOWED_HOSTS
+
+def _check_dangerous_scheme(text, urls):
+    if LITERAL_SCHEME_RE.search(text): return "DANGEROUS_SCHEME"
+    for url in urls:
+        if _bad_scheme(url): return "DANGEROUS_SCHEME"
+    return None
+
+def _check_external_exfil(urls):
+    for url in urls:
+        if _external_host(url): return "EXTERNAL_EXFIL"
+    return None
+
+def _channel_reason(channel, text):
+    if channel == "sql": return "SQL_METACHAR" if SQL_METACHAR_RE.search(text) else "SAFE"
+    if channel == "shell": return "SHELL_METACHAR" if SHELL_METACHAR_RE.search(text) else "SAFE"
+    if channel == "html":
+        if SCRIPT_TAG_RE.search(text): return "SCRIPT_TAG"
+        if EVENT_HANDLER_RE.search(text): return "EVENT_HANDLER"
+    
+    urls = _extract_urls(channel, text)
+    return _check_dangerous_scheme(text, urls) or _check_external_exfil(urls) or "SAFE"
+
+def evaluate(body):
+    if type(body) is not dict: return "INVALID_SCHEMA"
+    channel = body.get("channel")
+    output = body.get("output")
+    if type(channel) is not str or channel not in CHANNELS: return "INVALID_SCHEMA"
+    if type(output) is not str or len(output) > MAX_OUTPUT: return "INVALID_SCHEMA"
+    
+    decoded = _decode_once(output)
+    if decoded != output and _channel_reason(channel, decoded) != "SAFE":
+        return "ENCODED_PAYLOAD"
         
-        urls = []
-        if channel == "html":
-            matches = re.findall(r'(?i)\b(?:src|href)\s*=\s*(["\'])([\s\S]*?)\1', text)
-            urls = [m[1].strip() for m in matches if m[1].strip()]
-        elif channel == "markdown":
-            matches = re.findall(r'\]\(([\s\S]*?)\)', text)
-            urls = [m.strip().split()[0] for m in matches if m.strip()]
-        elif channel == "url":
-            urls = [text.strip()]
+    return _channel_reason(channel, output)
 
-        for u in urls:
-            u_norm = u.replace('\\', '/')
-            u_to_parse = 'https:' + u_norm if u_norm.startswith('//') else u_norm
-            try:
-                parsed = urllib.parse.urlparse(u_to_parse)
-                if parsed.scheme and parsed.scheme.lower() not in ["http", "https"]:
-                    return "DANGEROUS_SCHEME"
-            except Exception:
-                return "DANGEROUS_SCHEME"
-                
-        for u in urls:
-            u_norm = u.replace('\\', '/')
-            u_to_parse = 'https:' + u_norm if u_norm.startswith('//') else u_norm
-            try:
-                parsed = urllib.parse.urlparse(u_to_parse)
-                if parsed.scheme: 
-                    host = parsed.hostname.rstrip('.') if parsed.hostname else ""
-                    if host not in ALLOWED_HOSTS:
-                        return "EXTERNAL_EXFIL"
-            except Exception:
-                return "EXTERNAL_EXFIL"
-
-    if channel == "sql":
-        if re.search(r"(?i)(['\";]|--|/\*|\bunion\b|\bor\s+1\s*=\s*1)", text):
-            return "SQL_METACHAR"
-            
-    if channel == "shell":
-        if re.search(r"([;|&`<>]|\$\(|\$\{)", text):
-            return "SHELL_METACHAR"
-
-    return "SAFE"
-
-# Dual routing absorbs arbitrary trailing slashes supplied by grader testing frameworks
 @app.post("/sanitize-output")
 @app.post("/sanitize-output/")
 async def sanitize_output(request: Request):
-    # Stream-based chunking limits the buffer payload size natively
-    # This guarantees massive >20k limit tests will not OOM kill the application.
-    body = b""
     try:
-        async for chunk in request.stream():
-            body += chunk
-            if len(body) > 1_000_000:  
-                return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
+        body_bytes = await request.body()
+        payload = json.loads(body_bytes)
+        reason = evaluate(payload)
     except Exception:
-        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
-
-    try:
-        payload = json.loads(body.decode("utf-8"))
-    except Exception:
-        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
-    
-    if type(payload) is not dict:
-        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
+        reason = "INVALID_SCHEMA"
         
-    channel = payload.get("channel")
-    if channel not in ALLOWED_CHANNELS:
-        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
-        
-    output = payload.get("output")
-    if not isinstance(output, str) or len(output) > 20000:
-        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
-    
-    decoded_output = decode_payload(output)
-    if decoded_output != output:
-        reason_decoded = evaluate_channel(channel, decoded_output)
-        if reason_decoded != "SAFE":
-            return JSONResponse(content={"safe": False, "reason": "ENCODED_PAYLOAD"})
-
-    reason = evaluate_channel(channel, output)
-    return JSONResponse(content={"safe": (reason == "SAFE"), "reason": reason})
+    return JSONResponse(content={"safe": reason == "SAFE", "reason": reason})
