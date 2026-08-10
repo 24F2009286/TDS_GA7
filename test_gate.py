@@ -1,5 +1,6 @@
 import requests
 import sys
+import copy
 
 def test_release_gate():
     url = "http://localhost:8000/release-gate"
@@ -21,8 +22,8 @@ def test_release_gate():
         }
     }
     
-    # Unsafe Payload
-    unsafe_payload = safe_payload.copy()
+    # Deep copy prevents mutation of the safe_payload's nested dictionaries
+    unsafe_payload = copy.deepcopy(safe_payload)
     unsafe_payload["workflow"]["permissions"] = {"contents": "write"}
     
     try:
