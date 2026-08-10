@@ -156,46 +156,61 @@ async def terraform_plan(request: Request):
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
 
     # --- 1. Schema & Type Check ---
-    if not isinstance(payload, dict):
+    if type(payload) is not dict:
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
 
-    env = payload.get("environment")
-    state = payload.get("state")
-    prov_ver = payload.get("providerVersion")
-    destroy_app = payload.get("destroyApproved")
-    res = payload.get("resource")
-
-    # Top-level types
-    if not isinstance(env, str) or not isinstance(state, dict) or \
-       not isinstance(prov_ver, str) or not isinstance(destroy_app, bool) or \
-       not isinstance(res, dict):
+    # Check required top-level keys
+    req_keys = {"environment", "state", "providerVersion", "destroyApproved", "resource"}
+    if not req_keys.issubset(payload.keys()):
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
 
-    # State types
-    state_backend = state.get("backend")
-    state_locked = state.get("locked")
-    if not isinstance(state_backend, str) or not isinstance(state_locked, bool):
+    env = payload["environment"]
+    state = payload["state"]
+    prov_ver = payload["providerVersion"]
+    destroy_app = payload["destroyApproved"]
+    res = payload["resource"]
+
+    # Strict type checks (type() is safer than isinstance() for bools/ints in Python)
+    if type(env) is not str or type(state) is not dict or \
+       type(prov_ver) is not str or type(destroy_app) is not bool or \
+       type(res) is not dict:
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
 
-    # Resource types
-    r_addr = res.get("address")
-    r_type = res.get("type")
-    r_action = res.get("action")
-    r_labels = res.get("labels")
-    r_secret = res.get("secret")
-    r_force = res.get("forceDestroy")
-
-    if not isinstance(r_addr, str) or not isinstance(r_type, str) or \
-       not isinstance(r_action, str) or not isinstance(r_labels, dict) or \
-       not isinstance(r_force, bool):
+    # Check state keys
+    if "backend" not in state or "locked" not in state:
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
     
-    # Secret can be null or string
-    if r_secret is not None and not isinstance(r_secret, str):
+    state_backend = state["backend"]
+    state_locked = state["locked"]
+    if type(state_backend) is not str or type(state_locked) is not bool:
+        return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
+
+    # Check resource keys
+    res_keys = {"address", "type", "action", "labels", "secret", "forceDestroy"}
+    if not res_keys.issubset(res.keys()):
+        return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
+
+    r_addr = res["address"]
+    r_type = res["type"]
+    r_action = res["action"]
+    r_labels = res["labels"]
+    r_secret = res["secret"]
+    r_force = res["forceDestroy"]
+
+    if type(r_addr) is not str or type(r_type) is not str or type(r_action) is not str or \
+       type(r_labels) is not dict or type(r_force) is not bool:
+        return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
+    
+    # Secret must be explicitly None (null in JSON) or string
+    if r_secret is not None and type(r_secret) is not str:
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
         
-    # Labels must be string:string mappings
-    if any(not isinstance(k, str) or not isinstance(v, str) for k, v in r_labels.items()):
+    # Labels must be strictly string:string
+    if any(type(k) is not str or type(v) is not str for k, v in r_labels.items()):
+        return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
+
+    # THE FIX: Action must strictly be one of the enum values
+    if r_action not in {"create", "update", "delete"}:
         return JSONResponse(content={"decision": "reject", "reason": "INVALID_PLAN"})
 
     # --- 2. Environment Match ---
@@ -233,7 +248,6 @@ async def terraform_plan(request: Request):
             return JSONResponse(content={"decision": "reject", "reason": "DELETE_NOT_APPROVED"})
 
     # --- 8. Force Destroy ---
-    # The environment mismatch check (Rule 2) already proves this is the production environment.
     if r_type == "storage_bucket" and r_force is True:
         return JSONResponse(content={"decision": "reject", "reason": "FORCE_DESTROY"})
 
