@@ -11,29 +11,6 @@ app = FastAPI()
 ALLOWED_HOSTS = {"cdn-ox5ugw7.example", "app-xwwtkl4.example"}
 ALLOWED_CHANNELS = {"html", "markdown", "url", "sql", "shell"}
 
-@app.middleware("http")
-async def limit_payload_size(request: Request, call_next):
-    # Only enforce this on the specific firewall endpoint
-    if request.url.path == "/sanitize-output":
-        # Check Content-Length header if provided
-        content_length = request.headers.get('content-length')
-        if content_length and int(content_length) > 50000: # 50KB is well above the 20K char limit
-            return JSONResponse(status_code=200, content={"safe": False, "reason": "INVALID_SCHEMA"})
-        
-        # If no header, read the body chunks to prevent streaming DoS
-        body = b""
-        async for chunk in request.stream():
-            body += chunk
-            if len(body) > 50000:
-                return JSONResponse(status_code=200, content={"safe": False, "reason": "INVALID_SCHEMA"})
-        
-        # Reconstruct the request so FastAPI can still parse it normally if it's safe
-        async def receive():
-            return {"type": "http.request", "body": body}
-        request._receive = receive
-        
-    response = await call_next(request)
-    return response
 
 @app.post("/release-gate")
 async def release_gate(request: Request):
@@ -365,11 +342,14 @@ def evaluate_channel(channel: str, text: str) -> str:
 
 @app.post("/sanitize-output")
 async def sanitize_output(request: Request):
+    # Safely extract raw bytes for logging WITHOUT destroying the stream
     try:
-        payload = await request.json()
-        print(f"\n[INCOMING GRADER PAYLOAD] -> {json.dumps(payload)}", flush=True)
+        raw_bytes = await request.body()
+        raw_text = raw_bytes.decode('utf-8', errors='replace')
+        print(f"\n[INCOMING RAW] -> {raw_text}", flush=True)
+        payload = json.loads(raw_bytes)
     except Exception:
-        print("[INCOMING GRADER PAYLOAD] -> Malformed JSON / Not Parsable", flush=True)
+        print("[ERROR] -> Malformed JSON", flush=True)
         return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
     
     if type(payload) is not dict:
@@ -394,5 +374,5 @@ async def sanitize_output(request: Request):
             reason = evaluate_channel(channel, output)
             result = {"safe": (reason == "SAFE"), "reason": reason}
 
-    print(f"[FIREWALL DECISION OUT] -> {json.dumps(result)}\n", flush=True)
+    print(f"[FIREWALL DECISION] -> {json.dumps(result)}\n", flush=True)
     return JSONResponse(content=result)
