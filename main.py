@@ -6,8 +6,12 @@ app = FastAPI()
 
 @app.post("/release-gate")
 async def release_gate(request: Request):
-    payload = await request.json()
-    violations = []
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+        
+    violations = set() # Set prevents duplicate violation strings
     
     target = payload.get("target", "")
     event = payload.get("event", "")
@@ -18,53 +22,54 @@ async def release_gate(request: Request):
     # 1. Least Privilege Permissions
     expected_perms = {"contents": "read", "packages": "write", "id-token": "none"}
     if workflow.get("permissions") != expected_perms:
-        violations.append("EXCESS_PERMISSION")
+        violations.add("EXCESS_PERMISSION")
 
     # 2. PR Trigger Safety
-    if event == "pull_request":
-        if workflow.get("trigger") != "pull_request":
-            violations.append("UNSAFE_PR_TRIGGER")
+    trigger = workflow.get("trigger", "")
+    if (event == "pull_request" and trigger != "pull_request") or (trigger == "pull_request_target"):
+        violations.add("UNSAFE_PR_TRIGGER")
 
-    # 3. Test & Matrix Completion
-    if not workflow.get("testsPassed") or not workflow.get("matrixComplete") or workflow.get("failFast", True):
-        violations.append("TESTS_INCOMPLETE")
+    # 3. Test & Matrix Completion (Must strictly be True/False)
+    if workflow.get("testsPassed") is not True or \
+       workflow.get("matrixComplete") is not True or \
+       workflow.get("failFast") is not False:
+        violations.add("TESTS_INCOMPLETE")
 
-    # 4. Action Pinning (Third-party actions must use 40-char hex SHA)
+    # 4. Action Pinning
     hex_sha_regex = re.compile(r'^[a-f0-9]{40}$')
     for action in workflow.get("actions", []):
         if action.get("owner") != "actions":
             if not hex_sha_regex.fullmatch(action.get("ref", "")):
-                violations.append("MUTABLE_ACTION")
-                break # Only need to append once
+                violations.add("MUTABLE_ACTION")
 
     # 5. Image Stage
-    if not image.get("multiStage"):
-        violations.append("SINGLE_STAGE_IMAGE")
+    if image.get("multiStage") is not True:
+        violations.add("SINGLE_STAGE_IMAGE")
 
     # 6. Image Root Runtime
-    if image.get("runsAsRoot"):
-        violations.append("ROOT_RUNTIME")
+    if image.get("runsAsRoot") is not False:
+        violations.add("ROOT_RUNTIME")
 
     # 7. Image Secrets
     if image.get("secretMode") not in ["none", "buildkit"]:
-        violations.append("SECRET_IN_LAYER")
+        violations.add("SECRET_IN_LAYER")
 
     # 8. Critical Vulnerabilities
-    if image.get("criticalVulnerabilities", 1) > 0:
-        violations.append("CRITICAL_CVE")
+    if image.get("criticalVulnerabilities") != 0:
+        violations.add("CRITICAL_CVE")
 
     # 9. Pinned Image
-    if not image.get("digestPinned"):
-        violations.append("UNPINNED_IMAGE")
+    if image.get("digestPinned") is not True:
+        violations.add("UNPINNED_IMAGE")
 
     # 10. Production Overrides
     if target == "production":
         if event != "push" or ref != "refs/heads/main":
-            violations.append("INVALID_PRODUCTION_REF")
-        if not workflow.get("environmentApproval"):
-            violations.append("APPROVAL_REQUIRED")
+            violations.add("INVALID_PRODUCTION_REF")
+        if workflow.get("environmentApproval") is not True:
+            violations.add("APPROVAL_REQUIRED")
 
-    # Compile Final Decision
-    decision = "promote" if not violations else "block"
+    violations_list = list(violations)
+    decision = "promote" if not violations_list else "block"
     
-    return JSONResponse(content={"decision": decision, "violations": violations})
+    return JSONResponse(content={"decision": decision, "violations": violations_list})
