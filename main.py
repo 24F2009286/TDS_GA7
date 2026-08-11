@@ -440,60 +440,50 @@ async def sanitize_output(request: Request):
     return JSONResponse(content={"safe": True, "reason": "SAFE"})
 
 
-
 # ==========================================
 # GATE 5: OSINT Corroboration Engine
 # ==========================================
 @app.post("/corroborate")
 @app.post("/corroborate/")
 async def corroborate(request: Request):
-    # 1. Safe extraction and JSON parsing
     try:
-        body_bytes = await request.body()
-        if not body_bytes:
-            return JSONResponse(content={"verdict": "invalid", "confidence": "low", "corroboratingSources": []})
-        payload = json.loads(body_bytes)
+        payload = await request.json()
     except Exception:
         return JSONResponse(content={"verdict": "invalid", "confidence": "low", "corroboratingSources": []})
 
-    def invalid_response():
+    def invalid():
         return JSONResponse(content={"verdict": "invalid", "confidence": "low", "corroboratingSources": []})
 
-    # 2. Strict Schema Validation (Rule 1)
-    if type(payload) is not dict:
-        return invalid_response()
+    # 1. Strict Schema Validation
+    if type(payload) is not dict: return invalid()
 
     claim = payload.get("claim")
-    if type(claim) is not dict:
-        return invalid_response()
+    if type(claim) is not dict: return invalid()
     
     claim_val = claim.get("value")
-    if type(claim_val) is not str:
-        return invalid_response()
+    if type(claim_val) is not str: return invalid()
 
     as_of_str = payload.get("asOf")
-    if type(as_of_str) is not str:
-        return invalid_response()
+    if type(as_of_str) is not str: return invalid()
     
     try:
-        # Standardize Zulu time to offset for strict parsing
+        # Timezone Normalization: Force naive datetimes to UTC to prevent math crashes
         as_of_dt = datetime.fromisoformat(as_of_str.replace("Z", "+00:00"))
+        if as_of_dt.tzinfo is None:
+            as_of_dt = as_of_dt.replace(tzinfo=timezone.utc)
     except Exception:
-        return invalid_response()
+        return invalid()
 
-    staleness_days = payload.get("stalenessDays")
-    # Booleans are a subclass of int in Python, so strict type exclusion is required
-    if not isinstance(staleness_days, (int, float)) or type(staleness_days) is bool:
-        return invalid_response()
+    staleness = payload.get("stalenessDays")
+    if type(staleness) not in (int, float): return invalid()
 
     sources = payload.get("sources")
-    if type(sources) is not list:
-        return invalid_response()
+    if type(sources) is not list: return invalid()
 
-    # 3. Source Filtration (Freshness and Validity)
     allowed_types = {"dns", "ct_log", "registry", "archive", "scan"}
     valid_sources = []
     
+    # 2. Source Filtration
     for s in sources:
         if type(s) is not dict: continue
         if type(s.get("id")) is not str: continue
@@ -504,20 +494,17 @@ async def corroborate(request: Request):
         
         try:
             obs_dt = datetime.fromisoformat(s["observedAt"].replace("Z", "+00:00"))
+            if obs_dt.tzinfo is None:
+                obs_dt = obs_dt.replace(tzinfo=timezone.utc)
         except Exception:
             continue
             
-        # Calculate freshness
         delta_days = (as_of_dt - obs_dt).total_seconds() / 86400.0
-        if delta_days <= staleness_days:
+        if delta_days <= staleness:
             valid_sources.append(s)
 
-    # 4. Rule 2: Contradicted
-    contradicting = []
-    for s in valid_sources:
-        if s.get("authoritative") is True and s["value"] != claim_val:
-            contradicting.append(s["id"])
-            
+    # 3. Rule: Contradicted
+    contradicting = [s["id"] for s in valid_sources if s.get("authoritative") is True and s["value"] != claim_val]
     if contradicting:
         return JSONResponse(content={
             "verdict": "contradicted",
@@ -525,20 +512,15 @@ async def corroborate(request: Request):
             "corroboratingSources": sorted(contradicting)
         })
 
-    # 5. Rule 3: Supported
+    # 4. Rule: Supported (Group by Origin, keep lexicographically smallest ID)
     origins = {}
     for s in valid_sources:
         if s["value"] == claim_val:
-            origin = s["origin"]
-            if origin not in origins:
-                origins[origin] = []
-            origins[origin].append(s)
+            orig = s["origin"]
+            if orig not in origins or s["id"] < origins[orig]["id"]:
+                origins[orig] = s
 
-    reps = []
-    for origin, orig_sources in origins.items():
-        # Representative is the source with the lexicographically smallest ID
-        rep = min(orig_sources, key=lambda x: x["id"])
-        reps.append(rep)
+    reps = list(origins.values())
 
     if len(reps) >= 2:
         types = set(r["type"] for r in reps)
@@ -549,7 +531,7 @@ async def corroborate(request: Request):
             "corroboratingSources": sorted(r["id"] for r in reps)
         })
 
-    # 6. Rule 4: Unverified
+    # 5. Rule: Unverified
     return JSONResponse(content={
         "verdict": "unverified",
         "confidence": "low",
