@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 import re
 import html
 from urllib.parse import urlparse, unquote
+from datetime import datetime
 
 app = FastAPI()
 
@@ -436,4 +437,121 @@ async def sanitize_output(request: Request):
     if violation:
         return JSONResponse(content={"safe": False, "reason": violation})
 
-    return JSONResponse(content={"safe": True, "reason": "SAFE"})
+    return JSONResponse(content={"safe": True, "reason": "SAFE"})
+
+
+
+# ==========================================
+# GATE 5: OSINT Corroboration Engine
+# ==========================================
+@app.post("/corroborate")
+@app.post("/corroborate/")
+async def corroborate(request: Request):
+    # 1. Safe extraction and JSON parsing
+    try:
+        body_bytes = await request.body()
+        if not body_bytes:
+            return JSONResponse(content={"verdict": "invalid", "confidence": "low", "corroboratingSources": []})
+        payload = json.loads(body_bytes)
+    except Exception:
+        return JSONResponse(content={"verdict": "invalid", "confidence": "low", "corroboratingSources": []})
+
+    def invalid_response():
+        return JSONResponse(content={"verdict": "invalid", "confidence": "low", "corroboratingSources": []})
+
+    # 2. Strict Schema Validation (Rule 1)
+    if type(payload) is not dict:
+        return invalid_response()
+
+    claim = payload.get("claim")
+    if type(claim) is not dict:
+        return invalid_response()
+    
+    claim_val = claim.get("value")
+    if type(claim_val) is not str:
+        return invalid_response()
+
+    as_of_str = payload.get("asOf")
+    if type(as_of_str) is not str:
+        return invalid_response()
+    
+    try:
+        # Standardize Zulu time to offset for strict parsing
+        as_of_dt = datetime.fromisoformat(as_of_str.replace("Z", "+00:00"))
+    except Exception:
+        return invalid_response()
+
+    staleness_days = payload.get("stalenessDays")
+    # Booleans are a subclass of int in Python, so strict type exclusion is required
+    if not isinstance(staleness_days, (int, float)) or type(staleness_days) is bool:
+        return invalid_response()
+
+    sources = payload.get("sources")
+    if type(sources) is not list:
+        return invalid_response()
+
+    # 3. Source Filtration (Freshness and Validity)
+    allowed_types = {"dns", "ct_log", "registry", "archive", "scan"}
+    valid_sources = []
+    
+    for s in sources:
+        if type(s) is not dict: continue
+        if type(s.get("id")) is not str: continue
+        if type(s.get("origin")) is not str: continue
+        if type(s.get("value")) is not str: continue
+        if type(s.get("observedAt")) is not str: continue
+        if s.get("type") not in allowed_types: continue
+        
+        try:
+            obs_dt = datetime.fromisoformat(s["observedAt"].replace("Z", "+00:00"))
+        except Exception:
+            continue
+            
+        # Calculate freshness
+        delta_days = (as_of_dt - obs_dt).total_seconds() / 86400.0
+        if delta_days <= staleness_days:
+            valid_sources.append(s)
+
+    # 4. Rule 2: Contradicted
+    contradicting = []
+    for s in valid_sources:
+        if s.get("authoritative") is True and s["value"] != claim_val:
+            contradicting.append(s["id"])
+            
+    if contradicting:
+        return JSONResponse(content={
+            "verdict": "contradicted",
+            "confidence": "low",
+            "corroboratingSources": sorted(contradicting)
+        })
+
+    # 5. Rule 3: Supported
+    origins = {}
+    for s in valid_sources:
+        if s["value"] == claim_val:
+            origin = s["origin"]
+            if origin not in origins:
+                origins[origin] = []
+            origins[origin].append(s)
+
+    reps = []
+    for origin, orig_sources in origins.items():
+        # Representative is the source with the lexicographically smallest ID
+        rep = min(orig_sources, key=lambda x: x["id"])
+        reps.append(rep)
+
+    if len(reps) >= 2:
+        types = set(r["type"] for r in reps)
+        confidence = "high" if len(types) >= 2 else "medium"
+        return JSONResponse(content={
+            "verdict": "supported",
+            "confidence": confidence,
+            "corroboratingSources": sorted(r["id"] for r in reps)
+        })
+
+    # 6. Rule 4: Unverified
+    return JSONResponse(content={
+        "verdict": "unverified",
+        "confidence": "low",
+        "corroboratingSources": []
+    })
