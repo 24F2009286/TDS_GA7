@@ -1,9 +1,6 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 import re
-import html
-from urllib.parse import urlparse, unquote
-from datetime import datetime
 
 app = FastAPI()
 
@@ -256,191 +253,117 @@ async def terraform_plan(request: Request):
 
     # --- Pass ---
     return JSONResponse(content={"decision": "approve", "reason": "APPROVE"})
-
-
-# =====================================================================
-#  LLM Output Handling Gate  –  OWASP LLM05
-#  POST /sanitize-output
-# =====================================================================
+import urllib.parse
+import html as html_lib
+import re
 
 ALLOWED_HOSTS = {"cdn-ox5ugw7.example", "app-xwwtkl4.example"}
-VALID_CHANNELS = {"html", "markdown", "url", "sql", "shell"}
+ALLOWED_CHANNELS = {"html", "markdown", "url", "sql", "shell"}
 
-# ── Decoding helpers ─────────────────────────────────────────────────
+def decode_payload(text: str) -> str:
+    # 1. Percent-escapes
+    decoded = urllib.parse.unquote(text)
+    # 2. HTML entities
+    decoded = html_lib.unescape(decoded)
+    # 3. Unicode escapes (\uXXXX)
+    decoded = re.sub(r'\\u([0-9a-fA-F]{4})', lambda m: chr(int(m.group(1), 16)), decoded)
+    return decoded
 
-def decode_percent_escapes(s: str) -> str:
-    """Decode %XX sequences. Unlike urllib.unquote this never throws."""
-    return re.sub(
-        r'%([0-9A-Fa-f]{2})',
-        lambda m: chr(int(m.group(1), 16)),
-        s
-    )
+def evaluate_channel(channel: str, text: str) -> str:
+    # HTML-Specific Early Checks
+    if channel == "html":
+        if re.search(r'(?i)<\s*(script|iframe|object|embed)\b', text):
+            return "SCRIPT_TAG"
+        if re.search(r'(?i)\bon[a-z]+\s*=', text):
+            return "EVENT_HANDLER"
 
-def decode_html_entities(s: str) -> str:
-    """Decode &#NN; &#xNN; and the five named entities. &amp; decoded LAST."""
-    s = re.sub(r'&#x([0-9A-Fa-f]+);', lambda m: chr(int(m.group(1), 16)), s, flags=re.IGNORECASE)
-    s = re.sub(r'&#(\d+);', lambda m: chr(int(m.group(1))), s)
-    s = s.replace('&lt;', '<')
-    s = s.replace('&gt;', '>')
-    s = s.replace('&quot;', '"')
-    s = s.replace('&apos;', "'")
-    s = s.replace('&amp;', '&')
-    return s
+    # URL-Based Checks (HTML, Markdown, URL)
+    if channel in ["html", "markdown", "url"]:
+        # Global scheme check directly in text
+        if re.search(r'(?i)(javascript|data|vbscript)\s*:', text):
+            return "DANGEROUS_SCHEME"
+        
+        # Extract URLs based on channel
+        urls = []
+        if channel == "html":
+            matches = re.findall(r'(?i)(?:src|href)\s*=\s*(["\'])(.*?)\1', text)
+            urls = [m[1] for m in matches]
+        elif channel == "markdown":
+            urls = re.findall(r'\]\((.*?)\)', text)
+        elif channel == "url":
+            urls = [text.strip()]
 
-def decode_unicode_escapes(s: str) -> str:
-    """Decode \\uXXXX sequences."""
-    return re.sub(
-        r'\\u([0-9A-Fa-f]{4})',
-        lambda m: chr(int(m.group(1), 16)),
-        s,
-        flags=re.IGNORECASE
-    )
+        # Evaluate Extracted URLs for Dangerous Schemes
+        for u in urls:
+            u = u.strip()
+            if not u: continue
+            
+            u_to_parse = 'https:' + u if u.startswith('//') else u
+            parsed = urllib.parse.urlparse(u_to_parse)
+            
+            if parsed.scheme and parsed.scheme.lower() not in ["http", "https"]:
+                return "DANGEROUS_SCHEME"
+                
+        # Evaluate Extracted URLs for External Exfiltration
+        for u in urls:
+            u = u.strip()
+            if not u: continue
+            
+            u_to_parse = 'https:' + u if u.startswith('//') else u
+            parsed = urllib.parse.urlparse(u_to_parse)
+            
+            # If it has a scheme, it is considered an absolute URL
+            if parsed.scheme:
+                if parsed.hostname not in ALLOWED_HOSTS:
+                    return "EXTERNAL_EXFIL"
 
-def full_decode(s: str) -> str:
-    """Single-pass decode: percent → HTML entities → \\uXXXX."""
-    r = decode_percent_escapes(s)
-    r = decode_html_entities(r)
-    r = decode_unicode_escapes(r)
-    return r
+    # SQL Checks
+    if channel == "sql":
+        if re.search(r"(?i)(['\";]|--|/\*|\bunion\b|or\s+1\s*=\s*1)", text):
+            return "SQL_METACHAR"
+            
+    # Shell Checks
+    if channel == "shell":
+        if re.search(r"([;|&`<>]|\$\(|\$\{)", text):
+            return "SHELL_METACHAR"
 
-# ── Detection checks ─────────────────────────────────────────────────
-
-def has_script_tag(text: str) -> bool:
-    return bool(re.search(r'<\s*(script|iframe|object|embed)\b', text, re.IGNORECASE))
-
-def has_event_handler(text: str) -> bool:
-    return bool(re.search(r'\bon[a-z]+\s*=', text, re.IGNORECASE))
-
-def has_dangerous_scheme_in_text(text: str) -> bool:
-    return bool(re.search(r'(javascript|data|vbscript)\s*:', text, re.IGNORECASE))
-
-def is_absolute_url(u: str) -> bool:
-    return bool(re.match(r'^[a-zA-Z][a-zA-Z0-9+\-.]*:', u)) or u.startswith('//')
-
-def safe_parse_url(u: str):
-    """Parse a URL string, resolving protocol-relative as https."""
-    try:
-        if u.startswith('//'):
-            return urlparse('https:' + u)
-        return urlparse(u)
-    except Exception:
-        return None
-
-def extract_urls(channel: str, text: str) -> list:
-    urls = []
-    if channel == 'html':
-        for m in re.finditer(r'''(?:src|href)\s*=\s*(["'])([\s\S]*?)\1''', text, re.IGNORECASE):
-            urls.append(m.group(2))
-    elif channel == 'markdown':
-        for m in re.finditer(r'\]\(([^)]*)\)', text):
-            url = m.group(1).strip()
-            sp = url.find(' ')
-            if sp != -1:
-                url = url[:sp]
-            urls.append(url)
-    elif channel == 'url':
-        urls.append(text.strip())
-    return urls
-
-def check_dangerous_scheme(channel: str, text: str) -> bool:
-    if has_dangerous_scheme_in_text(text):
-        return True
-    for u in extract_urls(channel, text):
-        if not is_absolute_url(u):
-            continue
-        parsed = safe_parse_url(u)
-        if parsed and parsed.scheme:
-            scheme = parsed.scheme.lower()
-            if scheme not in ('http', 'https'):
-                return True
-    return False
-
-def check_external_exfil(channel: str, text: str) -> bool:
-    for u in extract_urls(channel, text):
-        if not is_absolute_url(u):
-            continue
-        parsed = safe_parse_url(u)
-        if parsed and parsed.hostname:
-            host = parsed.hostname.lower()
-            if host not in ALLOWED_HOSTS:
-                return True
-    return False
-
-def check_sql_metachar(text: str) -> bool:
-    if re.search(r"""['";]""", text):
-        return True
-    if '--' in text:
-        return True
-    if '/*' in text:
-        return True
-    if re.search(r'\bunion\b', text, re.IGNORECASE):
-        return True
-    if re.search(r'\bor\s+1\s*=\s*1', text, re.IGNORECASE):
-        return True
-    return False
-
-def check_shell_metachar(text: str) -> bool:
-    if re.search(r'[;&|`<>]', text):
-        return True
-    if '$(' in text:
-        return True
-    if '${' in text:
-        return True
-    return False
-
-# ── Channel violation dispatcher ─────────────────────────────────────
-
-def get_channel_violation(channel: str, text: str):
-    if channel == 'html':
-        if has_script_tag(text):                    return 'SCRIPT_TAG'
-        if has_event_handler(text):                 return 'EVENT_HANDLER'
-        if check_dangerous_scheme(channel, text):   return 'DANGEROUS_SCHEME'
-        if check_external_exfil(channel, text):     return 'EXTERNAL_EXFIL'
-    elif channel in ('markdown', 'url'):
-        if check_dangerous_scheme(channel, text):   return 'DANGEROUS_SCHEME'
-        if check_external_exfil(channel, text):     return 'EXTERNAL_EXFIL'
-    elif channel == 'sql':
-        if check_sql_metachar(text):                return 'SQL_METACHAR'
-    elif channel == 'shell':
-        if check_shell_metachar(text):              return 'SHELL_METACHAR'
-    return None
-
-# ── Endpoint ─────────────────────────────────────────────────────────
+    return "SAFE"
 
 @app.post("/sanitize-output")
 async def sanitize_output(request: Request):
     try:
-        body = await request.json()
+        payload = await request.json()
     except Exception:
         return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
+    
+    # 1. Top-Level Schema Checks
+    if type(payload) is not dict:
+        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
+        
+    channel = payload.get("channel")
+    output = payload.get("output")
+    
+    if channel not in ALLOWED_CHANNELS:
+        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
+        
+    if type(output) is not str or len(output) > 20000:
+        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
 
-    # Rule 1: INVALID_SCHEMA
-    if not isinstance(body, dict):
-        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
-    channel = body.get("channel")
-    output = body.get("output")
-    if channel not in VALID_CHANNELS:
-        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
-    if not isinstance(output, str):
-        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
-    if len(output) > 20000:
-        return JSONResponse(content={"safe": False, "reason": "INVALID_SCHEMA"})
-
-    # Rule 2: ENCODED_PAYLOAD
-    decoded = full_decode(output)
-    if decoded != output:
-        if get_channel_violation(channel, decoded):
+    # 2. Encoded Payload Check
+    decoded_output = decode_payload(output)
+    if decoded_output != output:
+        reason_decoded = evaluate_channel(channel, decoded_output)
+        if reason_decoded != "SAFE":
             return JSONResponse(content={"safe": False, "reason": "ENCODED_PAYLOAD"})
 
-    # Rule 3: Channel rules on original output
-    violation = get_channel_violation(channel, output)
-    if violation:
-        return JSONResponse(content={"safe": False, "reason": violation})
+    # 3. Standard Processing on Original Output
+    reason = evaluate_channel(channel, output)
+    if reason == "SAFE":
+        return JSONResponse(content={"safe": True, "reason": "SAFE"})
+    else:
+        return JSONResponse(content={"safe": False, "reason": reason})
 
-    return JSONResponse(content={"safe": True, "reason": "SAFE"})
-
-
-# ==========================================
+    # ==========================================
 # GATE 5: OSINT Corroboration Engine
 # ==========================================
 @app.post("/corroborate")
